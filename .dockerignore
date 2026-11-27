@@ -1,0 +1,10 @@
+.env
+.env.txt
+*.session
+__pycache__
+venv
+.git
+ORACLE_GUIDE.md
+setup.sh
+gen_session.py
+Dockerfile
