@@ -1,28 +1,30 @@
 """
-Telegram music bot with two features:
+Telegram music bot.
 
-  1. Download mode ("يوت"):
-     Anyone writes "يوت <song name>" in a group or private chat, and the bot
-     replies with the song as a playable audio file (caption: تم التحميل بنجاح ✅).
+Features
+  1. Download mode - anyone can ask for a song and get it as a playable audio
+     file. Works in private chats and in groups:
+         يوت <song name>          (Arabic trigger word)
+         /song <song name>        (also /yt)
+  2. Voice-chat mode ("تشغيل") - in a group with an active voice chat, an
+     assistant account joins and streams the song.
+     Extra words: "تخطي" (skip) and "إيقاف" (stop and clear the queue).
+  3. Commands: /start and /help.
 
-  2. Voice-chat mode ("تشغيل"):
-     In a group with an active voice chat, anyone writes "تشغيل <song name>"
-     and an assistant user account joins the voice chat and streams the song.
-     Extra commands: "تخطي" (skip) and "إيقاف" (stop and clear the queue).
-
-Architecture:
+Architecture
   - One Pyrogram client logged in with the bot token handles all messages.
   - A second Pyrogram client (the assistant, logged in with a session string
     from a regular Telegram account) plus pytgcalls streams audio into the
     group voice chat.
 
-Environment variables:
+Environment variables (put them in the .env file next to this script)
   BOT_TOKEN       - token from @BotFather (required)
   API_ID          - from https://my.telegram.org (required)
   API_HASH        - from https://my.telegram.org (required)
-  SESSION_STRING  - session string of the assistant account, generated with
-                    gen_session.py (required for voice-chat mode only;
-                    without it the bot runs in download-only mode)
+  SESSION_STRING  - assistant account session from gen_session.py
+                    (optional; without it the bot runs in download-only mode)
+  COOKIES_FILE    - optional path to a YouTube cookies.txt, only needed if
+                    YouTube starts asking for a sign-in
 """
 
 import asyncio
@@ -32,32 +34,31 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import urllib.request
-from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from collections import defaultdict, deque
 
 import yt_dlp
 from pyrogram import Client, filters, idle
-from pyrogram.types import Message
+from pyrogram.types import BotCommand, Message
 from pytgcalls import PyTgCalls
 from pytgcalls import filters as call_filters
 from pytgcalls.exceptions import NoActiveGroupCall
 from pytgcalls.types import AudioQuality, ChatUpdate, MediaStream, StreamEnded
 
-# ---------------------------------------------------------------------------
-# .env loading (must run BEFORE the settings below are read)
-# ---------------------------------------------------------------------------
 
-KNOWN_ENV_KEYS = {"BOT_TOKEN", "API_ID", "API_HASH", "SESSION_STRING"}
-
+# ---------------------------------------------------------------------------
+# Loading the .env file (must happen BEFORE the settings below are read)
+# ---------------------------------------------------------------------------
 
 def load_env_file() -> None:
     """Populate os.environ from a .env file sitting next to this script.
 
     Tolerant of Windows quirks: a UTF-8 BOM, a UTF-16 file saved by Notepad,
-    a file accidentally saved as ".env.txt" by Explorer hiding extensions,
-    spaces around the "=", quoted values, and invisible characters in keys.
-    Values already present in the real environment win.
+    and a file accidentally saved as ".env.txt" by Explorer hiding extensions.
+    A value that is already set (and not empty) in the real environment wins;
+    empty ones are filled from the file.
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
@@ -72,8 +73,8 @@ def load_env_file() -> None:
     with open(path, "rb") as f:
         raw = f.read()
 
-    # Detect the encoding: UTF-16 files start with a BOM (ff fe / fe ff) or
-    # contain NUL bytes; anything else is treated as UTF-8 (BOM stripped).
+    # UTF-16 files start with a BOM (ff fe / fe ff) or contain NUL bytes;
+    # anything else is treated as UTF-8 (BOM stripped).
     if raw[:2] in (b"\xff\xfe", b"\xfe\xff") or b"\x00" in raw[:200]:
         text = raw.decode("utf-16", errors="replace")
     else:
@@ -85,20 +86,23 @@ def load_env_file() -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        # Normalize the key: strip whitespace, NULs, BOM and zero-width chars.
-        key = key.strip().strip("\x00\ufeff\u200b\u200e\u200f").strip()
+        key = key.strip()
         value = value.strip().strip('"').strip("'")
-        if not key:
-            continue
-        # Match our known setting names case-insensitively.
-        if key.upper() in KNOWN_ENV_KEYS:
-            key = key.upper()
-        os.environ.setdefault(key, value)
-        loaded += 1
+        if key:
+            if not os.environ.get(key):
+                os.environ[key] = value
+            loaded += 1
     print(f"Loaded {loaded} setting(s) from {path}")
 
 
 load_env_file()
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -108,9 +112,21 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 SESSION_STRING = os.environ.get("SESSION_STRING")
+COOKIES_FILE = os.environ.get("COOKIES_FILE")
 
 # Telegram bots cannot upload files larger than this (bytes).
 MAX_FILE_SIZE = 49 * 1024 * 1024  # 49 MB, a small safety margin under 50 MB
+
+# Songs longer than this are refused BEFORE downloading (saves time + bandwidth).
+MAX_DURATION_SECONDS = 25 * 60
+
+# Download robustness (the googlevideo.com "timed out" errors).
+DOWNLOAD_ATTEMPTS = 3          # retries of the whole download on network errors
+SOCKET_TIMEOUT = 30            # seconds, per connection
+MAX_PARALLEL_DOWNLOADS = 2     # downloads running at the same time
+
+# A user must wait this many seconds between requests (anti-spam).
+COOLDOWN_SECONDS = 8
 
 # Triggers: a message that starts with the trigger word followed by the song name.
 DOWNLOAD_RE = re.compile(r"^\s*يوت\s+(.+?)\s*$", re.DOTALL)
@@ -118,11 +134,12 @@ PLAY_RE = re.compile(r"^\s*تشغيل\s+(.+?)\s*$", re.DOTALL)
 SKIP_RE = re.compile(r"^\s*تخطي\s*$")
 STOP_RE = re.compile(r"^\s*(إيقاف|ايقاف)\s*$")
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+# Words in a yt-dlp error that mean "network problem, worth retrying".
+NETWORK_ERROR_HINTS = (
+    "timed out", "timeout", "connection", "temporarily", "reset by peer",
+    "read error", "incomplete read", "503", "502", "remote end closed",
 )
-logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Clients
@@ -158,37 +175,103 @@ if VOICE_ENABLED:
 queues = defaultdict(deque)
 current = {}
 
+# Shared state for the download side.
+download_slots = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
+last_request = {}  # user_id -> time.monotonic() of the last accepted request
+
+
+def cooldown_left(user_id: int) -> float:
+    """Seconds the user still has to wait (0 means they can go ahead)."""
+    now = time.monotonic()
+    left = COOLDOWN_SECONDS - (now - last_request.get(user_id, -1e9))
+    if left > 0:
+        return left
+    last_request[user_id] = now
+    return 0.0
+
 
 # ---------------------------------------------------------------------------
 # YouTube search + download (blocking, runs in a worker thread)
 # ---------------------------------------------------------------------------
 
-def search_and_download(query: str, workdir: str) -> dict:
-    """Search YouTube for `query`, download the top result as mp3.
+def is_network_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(hint in text for hint in NETWORK_ERROR_HINTS)
 
-    Returns a dict with: path, workdir, title, performer, duration, query.
-    Raises ValueError("not_found") when YouTube has no results.
+
+def search_and_download(query: str, workdir: str, on_found=None) -> dict:
+    """Search YouTube for `query`, download the top result as an m4a file.
+
+    m4a is what Telegram's player likes, and YouTube already serves AAC audio
+    in an m4a container, so most of the time ffmpeg just copies it (no slow
+    re-encoding, unlike the old mp3 conversion).
+
+    `on_found(title)` is called once from the worker thread when the download
+    starts. Returns a dict with: path, workdir, title, performer, duration, query.
+    Raises ValueError("not_found") / ValueError("too_long").
     """
     output_template = os.path.join(workdir, "%(id)s.%(ext)s")
+    state = {"too_long": False, "announced": False}
+
+    def match_filter(info, *, incomplete=False):
+        duration = info.get("duration")
+        if isinstance(duration, (int, float)) and duration > MAX_DURATION_SECONDS:
+            state["too_long"] = True
+            return "too long"
+        return None
+
+    def progress_hook(d):
+        if state["announced"] or on_found is None or d.get("status") != "downloading":
+            return
+        state["announced"] = True
+        try:
+            on_found((d.get("info_dict") or {}).get("title") or "")
+        except Exception:
+            pass
+
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": output_template,
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,
         "noplaylist": True,
-        "default_search": "ytsearch1",
+        "match_filter": match_filter,
+        "progress_hooks": [progress_hook],
+        # --- network robustness / speed ---
+        "socket_timeout": SOCKET_TIMEOUT,
+        "retries": 10,
+        "fragment_retries": 10,
+        "extractor_retries": 3,
+        "source_address": "0.0.0.0",        # force IPv4 (IPv6 often times out)
+        "http_chunk_size": 10 * 1024 * 1024,  # avoids YouTube throttling
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
+                "preferredcodec": "m4a",
                 "preferredquality": "192",
             }
         ],
     }
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        ydl_opts["cookiefile"] = COOKIES_FILE
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"ytsearch1:{query}", download=True)
+    info = None
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"ytsearch1:{query}", download=True)
+            break
+        except yt_dlp.utils.DownloadError as e:
+            if attempt < DOWNLOAD_ATTEMPTS and is_network_error(e):
+                logger.warning("Network error (attempt %s/%s): %s", attempt,
+                               DOWNLOAD_ATTEMPTS, e)
+                time.sleep(2 * attempt)
+                continue
+            raise
 
+    if state["too_long"]:
+        raise ValueError("too_long")
     if not info or not info.get("entries"):
         raise ValueError("not_found")
 
@@ -196,18 +279,20 @@ def search_and_download(query: str, workdir: str) -> dict:
     if video is None:
         raise ValueError("not_found")
 
-    # After the ffmpeg post-processor runs, the file on disk ends with .mp3.
-    # The path matches the output template: <workdir>/<video id>.mp3
-    mp3_path = os.path.join(workdir, f"{video['id']}.mp3")
-    if not os.path.exists(mp3_path):
-        # Fallback: find any mp3 written into the workdir.
-        candidates = [f for f in os.listdir(workdir) if f.endswith(".mp3")]
-        if not candidates:
+    # The finished file is <workdir>/<video id>.m4a. Fall back to any audio
+    # file in the folder (ignoring half-finished .part files).
+    audio_path = os.path.join(workdir, f"{video['id']}.m4a")
+    if not os.path.exists(audio_path):
+        found = [
+            os.path.join(workdir, f) for f in os.listdir(workdir)
+            if f.lower().endswith((".m4a", ".mp3", ".opus", ".webm", ".ogg"))
+        ]
+        if not found:
             raise ValueError("not_found")
-        mp3_path = os.path.join(workdir, candidates[0])
+        audio_path = max(found, key=os.path.getsize)
 
     return {
-        "path": mp3_path,
+        "path": audio_path,
         "workdir": workdir,
         "title": video.get("title") or query,
         "performer": video.get("uploader") or video.get("channel") or "",
@@ -224,33 +309,61 @@ def cleanup_track(track: dict) -> None:
         pass
 
 
+def friendly_download_error(error: Exception) -> str:
+    """Turn a yt-dlp error into a short Arabic message for the user."""
+    text = str(error).lower()
+    if is_network_error(error):
+        return "النت عندي بيقطع وأنا بحمّل 😞 جرّب تاني كمان شوية."
+    if "sign in" in text or "not a bot" in text or "cookies" in text:
+        return "يوتيوب طالب تسجيل دخول للفيديو ده 😕 جرّب أغنية تانية."
+    if "age" in text and "restrict" in text:
+        return "الفيديو ده مقيّد بالسن ومقدرش أحمّله 😕 جرّب نسخة تانية."
+    if "private" in text or "unavailable" in text or "not available" in text:
+        return "الفيديو ده مش متاح عندي 😕 جرّب أغنية تانية أو اكتب الاسم بشكل مختلف."
+    return "حصلت مشكلة وأنا بحمّل الأغنية 😞 جرّب تاني بعد شوية."
+
+
 async def download_track(query: str, status_msg: Message):
     """Download a song, editing `status_msg` along the way.
 
     Returns the track dict, or None if the user was already told why it failed.
     """
+    loop = asyncio.get_running_loop()
+
+    def on_found(title: str) -> None:
+        # Called from the worker thread: hop back to the event loop.
+        if title:
+            asyncio.run_coroutine_threadsafe(
+                status_msg.edit_text(f"⬇️ بحمّل: {title}"), loop
+            )
+
     workdir = tempfile.mkdtemp(prefix="musicbot_")
     try:
-        track = await asyncio.to_thread(search_and_download, query, workdir)
-    except ValueError:
-        await status_msg.edit_text(
-            f"معلش، ملقيتش \"{query}\" على يوتيوب 😕 جرّب اسم تاني أو اكتبه بطريقة تانية."
-        )
+        async with download_slots:
+            track = await asyncio.to_thread(
+                search_and_download, query, workdir, on_found
+            )
+    except ValueError as e:
         shutil.rmtree(workdir, ignore_errors=True)
+        if str(e) == "too_long":
+            minutes = MAX_DURATION_SECONDS // 60
+            await status_msg.edit_text(
+                f"الأغنية دي أطول من {minutes} دقيقة 😕 جرّب نسخة أقصر."
+            )
+        else:
+            await status_msg.edit_text(
+                f"معلش، ملقيتش \"{query}\" على يوتيوب 😕 جرّب اسم تاني أو اكتبه بطريقة تانية."
+            )
         return None
-    except yt_dlp.utils.DownloadError:
+    except yt_dlp.utils.DownloadError as e:
         logger.exception("yt-dlp failed for query: %s", query)
-        await status_msg.edit_text(
-            "حصلت مشكلة وأنا بحمّل الأغنية 😞 جرّب تاني بعد شوية."
-        )
         shutil.rmtree(workdir, ignore_errors=True)
+        await status_msg.edit_text(friendly_download_error(e))
         return None
     except Exception:
         logger.exception("Unexpected error for query: %s", query)
-        await status_msg.edit_text(
-            "حصل خطأ غير متوقع 😞 جرّب تاني بعد شوية."
-        )
         shutil.rmtree(workdir, ignore_errors=True)
+        await status_msg.edit_text("حصل خطأ غير متوقع 😞 جرّب تاني بعد شوية.")
         return None
 
     file_size = os.path.getsize(track["path"])
@@ -265,12 +378,49 @@ async def download_track(query: str, status_msg: Message):
 
 
 # ---------------------------------------------------------------------------
-# Feature 1: "يوت <song name>" -> send the song as an audio file
+# Commands: /start and /help
 # ---------------------------------------------------------------------------
 
-@bot.on_message(filters.text & filters.regex(DOWNLOAD_RE))
-async def download_handler(client: Client, message: Message) -> None:
-    query = DOWNLOAD_RE.match(message.text).group(1).strip()
+def help_text() -> str:
+    lines = [
+        "🎵 أهلاً! أنا بوت الأغاني.",
+        "",
+        "📥 لتحميل أغنية:",
+        "• اكتب: يوت اسم الأغنية",
+        "• أو: /song اسم الأغنية",
+        "",
+    ]
+    if VOICE_ENABLED:
+        lines += [
+            "🎧 للمكالمات الصوتية (في الجروبات):",
+            "• تشغيل اسم الأغنية",
+            "• تخطي",
+            "• إيقاف",
+            "",
+        ]
+    lines += [
+        "مثال: يوت عصام صاصا",
+        f"⏱ أقصى مدة للأغنية {MAX_DURATION_SECONDS // 60} دقيقة.",
+    ]
+    return "\n".join(lines)
+
+
+@bot.on_message(filters.command(["start", "help"]))
+async def start_handler(client: Client, message: Message) -> None:
+    await message.reply_text(help_text())
+
+
+# ---------------------------------------------------------------------------
+# Feature 1: "يوت <song name>" or "/song <song name>" -> audio file
+# ---------------------------------------------------------------------------
+
+async def send_song(message: Message, query: str) -> None:
+    """Shared by the "يوت" trigger and the /song command."""
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    wait = cooldown_left(user_id)
+    if wait:
+        await message.reply_text(f"استنى {int(wait) + 1} ثواني وابعت تاني ⏳")
+        return
 
     status = await message.reply_text(f"🔍 بدور على: {query} ...")
     track = await download_track(query, status)
@@ -297,6 +447,21 @@ async def download_handler(client: Client, message: Message) -> None:
             pass
     finally:
         cleanup_track(track)
+
+
+@bot.on_message(filters.text & filters.regex(DOWNLOAD_RE))
+async def download_handler(client: Client, message: Message) -> None:
+    query = DOWNLOAD_RE.match(message.text).group(1).strip()
+    await send_song(message, query)
+
+
+@bot.on_message(filters.command(["song", "yt"]))
+async def song_command_handler(client: Client, message: Message) -> None:
+    query = " ".join(message.command[1:]).strip()
+    if not query:
+        await message.reply_text("اكتب اسم الأغنية بعد الأمر، مثال:\n/song عصام صاصا")
+        return
+    await send_song(message, query)
 
 
 # ---------------------------------------------------------------------------
@@ -454,19 +619,13 @@ else:
             "بس تقدر تكتب \"يوت\" واسم الأغنية وأنا أنزلهالك على طول 🎵"
         )
 
-
 # ---------------------------------------------------------------------------
-# Health endpoint + self keep-alive (for free-tier web hosting)
+# Health endpoint + self keep-alive (needed for the free web host: it only
+# hosts "web services", so the bot answers HTTP on the port it is given and
+# pings its own public URL every few minutes to stay awake)
 # ---------------------------------------------------------------------------
 
 def start_health_server() -> None:
-    """Tiny HTTP server so the hosting platform sees a healthy web service.
-
-    Free tiers (Render) only host web services, so the bot binds a port and
-    answers 200 on every path. It also pings its own public URL every few
-    minutes: the request comes back in through the platform's load balancer
-    and counts as inbound traffic, which keeps the free instance awake.
-    """
     port = int(os.environ.get("PORT", "10000"))
 
     class Handler(BaseHTTPRequestHandler):
@@ -477,7 +636,7 @@ def start_health_server() -> None:
             self.wfile.write("music bot is alive".encode("utf-8"))
 
         def log_message(self, *args):
-            pass  # keep logs clean
+            pass  # keep the logs clean
 
     server = HTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -512,12 +671,6 @@ def main() -> None:
         if not value
     ]
     if missing:
-        # Self-diagnosing output: show which setting keys are actually
-        # visible (names only, never values) so a screenshot tells the story.
-        visible = sorted(
-            k for k in os.environ if k.strip().upper() in KNOWN_ENV_KEYS
-        )
-        print(f"Setting keys currently visible to the bot: {visible}")
         raise SystemExit(
             "Missing environment variables: "
             + ", ".join(missing)
@@ -527,6 +680,17 @@ def main() -> None:
     start_health_server()
     bot.start()
     logger.info("Bot client started.")
+
+    # Show the commands in Telegram's "/" menu.
+    try:
+        bot.set_bot_commands([
+            BotCommand("start", "ابدأ واعرف الأوامر"),
+            BotCommand("help", "شرح الأوامر"),
+            BotCommand("song", "حمّل أغنية: /song اسم الأغنية"),
+        ])
+    except Exception:
+        logger.warning("Could not register the command menu.", exc_info=True)
+
     if VOICE_ENABLED:
         calls.start()  # starts the assistant client and the calls binding
         logger.info("Assistant + voice calls started.")
