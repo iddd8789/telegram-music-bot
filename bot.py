@@ -254,6 +254,7 @@ def search_and_download(query: str, workdir: str, on_found=None) -> dict:
         # access from the datacenter IP (PO token / solver errors matter)
         "quiet": False,
         "no_warnings": False,
+        "verbose": True,
         "noprogress": True,
         "noplaylist": True,
         "match_filter": match_filter,
@@ -271,7 +272,7 @@ def search_and_download(query: str, workdir: str, on_found=None) -> dict:
         # (fix for yt-dlp/ejs#79, not yet released upstream); dev mode
         # bypasses yt-dlp's release-hash check so the patch is used.
         "extractor_args": {
-            "youtube": {"player_client": ["mweb", "web_safari"]},
+            "youtube": {"player_client": ["mweb", "web_safari", "tv", "web_embedded", "android_vr"]},
             "youtube-ejs": {"dev": ["true"]},
         },
         "source_address": "0.0.0.0",        # force IPv4 (IPv6 often times out)
