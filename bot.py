@@ -118,6 +118,9 @@ COOKIES_DATA = os.environ.get("COOKIES_DATA")
 # Cookies can be supplied either as a mounted file (COOKIES_FILE) or inline
 # as an environment variable (COOKIES_DATA holds the file content itself).
 if COOKIES_DATA and not (COOKIES_FILE and os.path.exists(COOKIES_FILE)):
+    # Some .env importers keep the escape sequences instead of real newlines.
+    if "\\n" in COOKIES_DATA:
+        COOKIES_DATA = COOKIES_DATA.replace("\\n", "\n")
     _cookies_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
     with open(_cookies_path, "w", encoding="utf-8") as _f:
         _f.write(COOKIES_DATA if COOKIES_DATA.endswith("\n") else COOKIES_DATA + "\n")
@@ -262,7 +265,13 @@ def search_and_download(query: str, workdir: str, on_found=None) -> dict:
         # plugin, server on localhost) + a JS runtime for the challenge
         # solver (node is present in the Docker image).
         "js_runtimes": {"node": {}},
-        "extractor_args": {"youtube": {"player_client": ["mweb", "web_safari"]}},
+        # youtube-ejs dev=true: the image ships a PATCHED challenge solver
+        # (fix for yt-dlp/ejs#79, not yet released upstream); dev mode
+        # bypasses yt-dlp's release-hash check so the patch is used.
+        "extractor_args": {
+            "youtube": {"player_client": ["mweb", "web_safari"]},
+            "youtube-ejs": {"dev": ["true"]},
+        },
         "source_address": "0.0.0.0",        # force IPv4 (IPv6 often times out)
         "http_chunk_size": 10 * 1024 * 1024,  # avoids YouTube throttling
         "postprocessors": [
