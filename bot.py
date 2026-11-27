@@ -250,8 +250,10 @@ def search_and_download(query: str, workdir: str, on_found=None) -> dict:
     ydl_opts = {
         "format": "bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": output_template,
-        "quiet": True,
-        "no_warnings": True,
+        # keep yt-dlp warnings in the server logs while we verify YouTube
+        # access from the datacenter IP (PO token / solver errors matter)
+        "quiet": False,
+        "no_warnings": False,
         "noprogress": True,
         "noplaylist": True,
         "match_filter": match_filter,
