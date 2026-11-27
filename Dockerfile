@@ -1,5 +1,5 @@
 # --- Stage 1: build the bgutil PO Token provider server (Node.js) ---
-FROM node:22-slim AS potbuild
+FROM node:22-bookworm-slim AS potbuild
 WORKDIR /pot
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
@@ -10,14 +10,14 @@ WORKDIR /pot/server
 RUN npm ci && npx tsc
 
 # --- Stage 2: runtime ---
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 # node runtime: used by yt-dlp's EJS challenge solver and the POT server
-COPY --from=node:22-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
 
 WORKDIR /app
 COPY requirements.txt .
