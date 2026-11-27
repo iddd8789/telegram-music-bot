@@ -113,6 +113,21 @@ API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 SESSION_STRING = os.environ.get("SESSION_STRING")
 COOKIES_FILE = os.environ.get("COOKIES_FILE")
+COOKIES_DATA = os.environ.get("COOKIES_DATA")
+
+# Cookies can be supplied either as a mounted file (COOKIES_FILE) or inline
+# as an environment variable (COOKIES_DATA holds the file content itself).
+if COOKIES_DATA and not (COOKIES_FILE and os.path.exists(COOKIES_FILE)):
+    _cookies_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+    with open(_cookies_path, "w", encoding="utf-8") as _f:
+        _f.write(COOKIES_DATA if COOKIES_DATA.endswith("\n") else COOKIES_DATA + "\n")
+    COOKIES_FILE = _cookies_path
+if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+    logger.info("YouTube cookies loaded: %s (%d bytes)",
+                COOKIES_FILE, os.path.getsize(COOKIES_FILE))
+else:
+    logger.warning("No YouTube cookies available "
+                   "(COOKIES_FILE / COOKIES_DATA not set)")
 
 # Telegram bots cannot upload files larger than this (bytes).
 MAX_FILE_SIZE = 49 * 1024 * 1024  # 49 MB, a small safety margin under 50 MB
@@ -243,6 +258,11 @@ def search_and_download(query: str, workdir: str, on_found=None) -> dict:
         "retries": 10,
         "fragment_retries": 10,
         "extractor_retries": 3,
+        # YouTube from datacenter IPs needs: PO tokens (bgutil provider
+        # plugin, server on localhost) + a JS runtime for the challenge
+        # solver (node is present in the Docker image).
+        "js_runtimes": {"node": {}},
+        "extractor_args": {"youtube": {"player_client": ["mweb", "web_safari"]}},
         "source_address": "0.0.0.0",        # force IPv4 (IPv6 often times out)
         "http_chunk_size": 10 * 1024 * 1024,  # avoids YouTube throttling
         "postprocessors": [
